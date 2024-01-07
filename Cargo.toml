@@ -28,3 +28,11 @@ erased-serde = "0.3.26"
 serde = {version = "1.0.166", features = ["derive"]}
 aws-config = "0.55.3"
 teloxide = "0.12.2"
+openssl = { version = "0.10.35", features = ["vendored"] }
+ocrs = "0.3.1"
+
+rten = { version = "0.2.0" }
+rten-imageproc = { version = "0.1.0" }
+rten-tensor = { version = "0.1.0" }
+image = { version = "0.24.6", default-features = false, features = ["png", "jpeg", "jpeg_rayon", "webp"] }
+
