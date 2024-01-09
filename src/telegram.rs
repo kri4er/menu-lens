@@ -1,29 +1,24 @@
 use lambda_http::{Body, Error, Request, Response};
 
-use std::env;
 use teloxide::{
     net::Download,
     payloads::SendMessageSetters,
     requests::Requester,
     types::UpdateKind,
+    types::{InlineKeyboardButton, InlineKeyboardMarkup},
     Bot,
 };
 use tracing::info;
-use teloxide::types::ChatAction::Typing;
+use reqwest;
 
 use crate::aiutils;
 use crate::utils;
 
-const MINUTE_LIMIT: u32 = 5;
-
-#[derive(PartialEq)]
-enum MediaType {
-    Voice,
-    VideoNote,
-}
-
 pub async fn handle_telegram_request(req: Request) -> Result<Response<Body>, Error> {
     let bot = Bot::new(env::var("TELEGRAM_BOT_TOKEN").unwrap());
+
+    info!("Received request {:?}", req);
+
     let update = utils::convert_input_to_json(req).await?;
 
     // Match the update type
@@ -31,78 +26,79 @@ pub async fn handle_telegram_request(req: Request) -> Result<Response<Body>, Err
         // If the update is a message
         UpdateKind::Message(message) => {
             // Check if the message is a voice message
-            if message.voice().is_none() && message.video_note().is_none() {
-                info!("Not a voice or video message");
+            if message.photo().is_none() {
+                info!("Not a photo message");
+                bot.send_message(message.chat.id, "I only accept photo messages.")
+                    .reply_to_message_id(message.id)
+                    .disable_web_page_preview(true)
+                    .disable_notification(true)
+                    .allow_sending_without_reply(true)
+                    .await?;
+
                 return Ok(Response::builder()
                     .status(200)
-                    .body(Body::Text("Not a voice or video message".into()))
+                    .body(Body::Text("Not a photo message".into()))
                     .unwrap());
             }
 
-            let media_type = if message.voice().is_some() {
-                info!("Received voice message");
-                MediaType::Voice
-            } else {
-                info!("Received video message");
-                MediaType::VideoNote
-            };
+            let photo = message.photo()
+                .expect("Photo is not present in the message.")
+                .last().expect("Last photo object is not valid.");
 
-            // Get the voice duration 
-            let duration = if message.voice().is_some() {
-                message.voice().unwrap().duration
-            } else {
-                message.video_note().unwrap().duration
-            };
-
-            // Check if voice message is longer than 1 minute
-            if duration > MINUTE_LIMIT * 60 {
-                // Send a message to the user
-                bot.send_message(
-                    message.chat.id,
-                    format!(
-                        "The audio message is too long. Maximum duration is {MINUTE_LIMIT} minutes."
-                    ),
-                )
-                .await?;
-                return Ok(Response::builder()
-                    .status(200)
-                    .body(Body::Text("Message too long".into()))
-                    .unwrap());
-            }
-
-            // Now that we know that the voice message is shorter then x minutes, download it and send it to openai
-            // Send "typing" action to user
-            bot.send_chat_action(message.chat.id, Typing)
-                .await?;
-
-            let voice_id = if media_type == MediaType::Voice {
-                message.voice().unwrap().file.id.clone()
-            } else {
-                message.video_note().unwrap().file.id.clone()
-            };
-            let file = bot.get_file(voice_id).await?;
+            let file = bot.get_file(&photo.file.id).await?;
             let file_path = file.path.clone();
-            let mut buffer = Vec::new();
-            info!("Downloading file to buffer");
+            let mut buffer:Vec<u8> = Vec::new();
+            info!("Downloading file by id: {:?} to buffer", &photo.file.id);
             bot.download_file(&file_path, &mut buffer).await?;
 
             // Send file to OpenAI Whisper for transcription
-            info!("Sending file to OpenAI Whisper for transcription");
-            let mut text = aiutils::transcribe_image(buffer).await?.get(0).unwrap().clone();
+            info!("Transcribe image using OCR using English lang");
+            match aiutils::transcribe_image(buffer).await {
+                Ok(lines) => {
+                    let keyboard:Vec<InlineKeyboardButton> = lines.into_iter()
+                        .filter(|l| l.len() > 2)
+                        .map(|line| InlineKeyboardButton::url(
+                                line.clone(),
+                                reqwest::Url::parse(
+                                    format!("https://www.google.com/search?q={}&tbm=isch", line.replace(" ", "+")).to_string().as_ref()
+                                    ).ok().unwrap()
+                                )
+                            ).collect();
+                    let chunks:Vec<Vec<InlineKeyboardButton>> = keyboard.chunks(3).map(|k|k.to_vec()).collect();
+                    if chunks.len() > 0 {
+                        let mut markup = InlineKeyboardMarkup::new([chunks[0].clone()]);
+                        for (_, chunk) in chunks.into_iter().skip(1).enumerate() {
+                            markup = markup.append_row(chunk);
+                        }
 
-            if text.is_empty() {
-                text = "<no text>".to_string();
-            }
-
-            // Send text to user
-            bot.send_message(message.chat.id, text)
-                .reply_to_message_id(message.id)
-                .disable_web_page_preview(true)
-                .disable_notification(true)
-                .allow_sending_without_reply(true)
-                .await?;
+                        bot.send_message(message.chat.id, "Please pick the dish.".to_string())
+                            .reply_markup(markup)
+                            .reply_to_message_id(message.id)
+                            //.disable_web_page_preview(true)
+                            .disable_notification(true)
+                            .allow_sending_without_reply(true)
+                            .await?;
+                    } else {
+                        bot.send_message(message.chat.id, "Sorry, can't parse your image.".to_string())
+                            .reply_to_message_id(message.id)
+                            .disable_web_page_preview(true)
+                            .disable_notification(true)
+                            .allow_sending_without_reply(true)
+                            .await?;
+                    }
+                                
+                },
+                Err(_) => {
+                    bot.send_message(message.chat.id, "Sorry, can't parse your image.".to_string())
+                        .reply_to_message_id(message.id)
+                        .disable_web_page_preview(true)
+                        .disable_notification(true)
+                        .allow_sending_without_reply(true)
+                        .await?;
+                },
+            };
         }
-        _ => {}
+        _ => { }
     }
 
     Ok(Response::builder()

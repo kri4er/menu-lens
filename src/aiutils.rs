@@ -2,12 +2,14 @@ use std::{path::Path, fs, fmt};
 use rten::Model;
 
 use lambda_http::{http::HeaderMap, Error};
+use rten_tensor::NdTensor;
 
-use crate::{utils::read_image, output::{OutputFormat, format_text_output}};
+use crate::{utils::{read_image, read_buffer}, output::{OutputFormat, format_text_output}};
 use ocrs::{DecodeMethod, OcrEngine, OcrEngineParams};
 
-const DETECTION_MODEL: &str = "models/text-detection.rten";
-const RECOGNITION_MODEL: &str = "models/text-recognition.rten";
+const DETECTION_MODEL: &str = "/models/text-detection.rten";
+const RECOGNITION_MODEL: &str = "/models/text-recognition.rten";
+use tracing::info;
 
 /// Adds context to an error reading or parsing a file.
 trait FileErrorContext<T> {
@@ -18,98 +20,88 @@ trait FileErrorContext<T> {
 
 impl<T, E: std::fmt::Display> FileErrorContext<T> for Result<T, E> {
     fn file_error_context<P: fmt::Display>(self, context: &str, path: P) -> Result<T, String> {
-        self.map_err(|err| format!("{} from \"{}\": {}", context, path, err))
+        self.map_err(|err| format!("{} from {}: {}", context, path, err))
     }
 }
 
-async fn transcribe_image_low() -> Result<(), Box<dyn std::error::Error>> {
-    let model_path:&str = "/home/ydederkal/develop/rust/menu-lens/models/text-detection.rten";
+fn get_exec_dir() -> String {
+    let mut rsrc_dir = std::env::current_exe()
+        .expect("Can't find path to executable");
+    // Directory containing binary
+    rsrc_dir.pop();
+    rsrc_dir.to_str().unwrap().to_string()
+}
 
-    let detection_model = load_model(model_path.into())
-        .file_error_context("Failed to load text detection model", model_path)?;
+async fn transcribe_tensor_image(buffer: NdTensor<f32, 3>) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let exec_dir = get_exec_dir();
+    info!("Running in the directory: {:?}", exec_dir);
+    let detection_model_path = exec_dir.clone() + DETECTION_MODEL;
+    let recognition_model_path = exec_dir.clone() + RECOGNITION_MODEL;
 
-    let recognition_model_src:&str = "/home/ydederkal/develop/rust/menu-lens/models/text-recognition.rten";
-    let recognition_model = load_model(recognition_model_src)
-        .file_error_context("Failed to load text recognition model", recognition_model_src)?;
+    let detection_model = load_model(&detection_model_path)
+        .file_error_context("Failed to load text detection model", detection_model_path)?;
 
-    let image_path = "/home/ydederkal/develop/rust/menu-lens/data/de_hofbrau.png";
-    let color_img = read_image(&image_path)?;
+    let recognition_model = load_model(&recognition_model_path)
+        .file_error_context("Failed to load text recognition model", recognition_model_path)?;
+
+    let color_img = buffer;
 
     let engine = OcrEngine::new(OcrEngineParams {
         detection_model: Some(detection_model),
         recognition_model: Some(recognition_model),
-        debug: true,
-        decode_method: if false {
+        debug: false,
+        decode_method: if true {
             DecodeMethod::BeamSearch { width: 100 }
         } else {
             DecodeMethod::Greedy
         },
-    }).unwrap();
+    })?;
 
     let ocr_input = engine.prepare_input(color_img.view())?;
     let word_rects = engine.detect_words(&ocr_input)?;
     let line_rects = engine.find_text_lines(&ocr_input, &word_rects);
+    // TODO: join text lines by rectangle distances 
     let line_texts = engine.recognize_text(&ocr_input, &line_rects)?;
 
-    let output_path:Option<String> = None;
+    let lines: Vec<String> = line_texts
+        .iter()
+        .flatten()
+        .map(|line| line.to_string())
+        .collect();
 
-    let write_output_str = |content: String| -> Result<(), Box<dyn std::error::Error>> {
-        if let Some(output_path) = &output_path {
-            std::fs::write(output_path, content.into_bytes())?;
-        } else {
-            println!("{}", content);
-        }
-        Ok(())
-    };
+    Ok(lines)
+}
 
-
-    let output_format = OutputFormat::Text;
-    match output_format {
-        OutputFormat::Text => {
-            let content = format_text_output(&line_texts);
-            write_output_str(content)?;
+pub async fn transcribe_image(buffer: Vec<u8>) -> Result<Vec<String>, String> {
+    let image_content = read_buffer(&buffer).expect("Can't convert image buff into NdTensor<f32, 3>");
+    match transcribe_tensor_image(image_content).await {
+        Ok(res) => {
+            info!("Success {:?}", res);
+            Ok(res)
+        },
+        Err(e) => {
+            info!("Failed to process text with err: {:?}", e);
+            Err("Can't transribe image with error: {e}".into())
         }
-        _ => panic!("Do not know what to do with png")
-        /*
-        OutputFormat::Json => {
-            let content = format_json_output(FormatJsonArgs {
-                input_path: &args.image,
-                input_hw: color_img.shape()[1..].try_into()?,
-                text_lines: &line_texts,
-            });
-            write_output_str(content)?;
-        }
-        */
-        /*
-        OutputFormat::Png => {
-            let png_args = GeneratePngArgs {
-                img: color_img.view(),
-                line_rects: &line_rects,
-                text_lines: &line_texts,
-            };
-            let annotated_img = generate_annotated_png(png_args);
-            let Some(output_path) = args.output_path else {
-                return Err("Output path must be specified when generating annotated PNG".into());
-            };
-            write_image(&output_path, annotated_img.view())?;
-        }
-        */
     }
-
-    
-    Ok(())
 }
-
-pub async fn transcribe_image(buffer: Vec<u8>) -> Result<Vec<String>, Error> {
-    transcribe_image_low().await.ok().unwrap();
-    let result = vec!["Hello from lambda image to text using OCRs".to_string()];
-    Ok(result)
-}
-
-
 
 pub fn load_model(source_path: &str) -> Result<Model, Box<dyn std::error::Error>> {
     let model_bytes = fs::read(source_path)?;
     let model = Model::load(&model_bytes)?;
     Ok(model)
+}
+
+#[cfg(test)]
+mod test_aiutils {
+    use crate::{aiutils::transcribe_tensor_image, utils::{read_buffer, read_image}};
+
+    #[tokio::test]
+    async fn test_generate_annotated_png() {
+        let image_path = "/home/ydederkal/develop/rust/menu-lens/data/de_hofbrau.png";
+
+        transcribe_tensor_image(read_image(&image_path).unwrap()).await.ok().unwrap();
+        println!("LOGME: Done!!!");
+        //assert_eq!(annotated.shape(), img.shape());
+    }
 }

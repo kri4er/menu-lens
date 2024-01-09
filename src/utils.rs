@@ -32,8 +32,21 @@ pub fn read_image(path: &str) -> Result<NdTensor<f32, 3>, Box<dyn std::error::Er
     Ok(float_img)
 }
 
-pub async fn read_image_file(file_path: &str) -> Result<Vec<u8>, Error> {
-    let result = vec![1, 2, 3];
+pub fn read_buffer(buffer: &Vec<u8>) -> Result<NdTensor<f32, 3>, Box<dyn std::error::Error>> {
+    let input_img = image::load_from_memory(buffer)?;
+    let input_img = input_img.into_rgb8();
 
-    Ok(result)
+    let (width, height) = input_img.dimensions();
+
+    let in_chans = 3;
+    let mut float_img = NdTensor::zeros([in_chans, height as usize, width as usize]);
+    for c in 0..in_chans {
+        let mut chan_img = float_img.slice_mut([c]);
+        for y in 0..height {
+            for x in 0..width {
+                chan_img[[y as usize, x as usize]] = input_img.get_pixel(x, y)[c] as f32 / 255.0
+            }
+        }
+    }
+    Ok(float_img)
 }
